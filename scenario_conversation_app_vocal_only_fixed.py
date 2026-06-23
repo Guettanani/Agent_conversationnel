@@ -19259,7 +19259,13 @@ class VRScenarioApp:
         print("=" * 60 + "\n")
 
     @staticmethod
-    def _build_oral_summary(scenario_json: Dict[str, Any]) -> str:
+    def _build_oral_summary(scenario_json) -> str:
+        if isinstance(scenario_json, list):
+            if not scenario_json:
+                return "Le scénario vient d'être généré, mais il est vide."
+            scenario_json = scenario_json[0] if isinstance(scenario_json[0], dict) else {}
+        if not isinstance(scenario_json, dict):
+            return "Le scénario vient d'être généré."
         resume = scenario_json.get("resume_oral", "")
         if resume:
             return resume
@@ -19274,15 +19280,23 @@ class VRScenarioApp:
             )
         return "Le scénario " + titre + " vient d'être généré."
 
-    def _announce_scenario(self, scenario_json: Dict[str, Any], scenario_text: str) -> None:
+    def _announce_scenario(self, scenario_json, scenario_text: str) -> None:
         """Présente les grandes lignes du scénario à voix haute."""
         self._print_scenario_debug(scenario_json, scenario_text)
+
+        if isinstance(scenario_json, list):
+            if not scenario_json:
+                scenario_json = {}
+            elif isinstance(scenario_json[0], dict):
+                scenario_json = scenario_json[0]
+            else:
+                scenario_json = {}
 
         resume = self._build_oral_summary(scenario_json)
         self.io.speak("Voici les grandes lignes de votre scénario.")
         self.io.speak(resume)
 
-        vigilance = scenario_json.get("points_vigilance", [])
+        vigilance = scenario_json.get("points_vigilance", []) if isinstance(scenario_json, dict) else []
         if vigilance:
             points = " et ".join(vigilance[:3])
             self.io.speak("Les points de vigilance à retenir sont : " + points + ".")
