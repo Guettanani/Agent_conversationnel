@@ -2,12 +2,14 @@
 
 Fonctions atomiques pour charger des fichiers depuis le filesystem
 et les découper en chunks prêts pour l'indexation vectorielle.
+Inclut réparation d'encodage et fallback OCR pour PDFs scannées.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
@@ -20,8 +22,132 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
+# Encodage / Fallback helpers
 # ---------------------------------------------------------------------------
+
+_GARBLE_PATTERN = re.compile(r"[�\x00-\x08\x0b\x0e\x1f]")
+_SPACED_DIGITS = re.compile(r"(?<=\d) (?=\d)")
+_SPACED_LETTERS_AFTER_DOT = re.compile(r"\. ([A-Za-zÀ-ÿ])")
+
+
+def _repair_text(text: str) -> str:
+    """Répare les problèmes courants d'encodage extraits des PDF.
+
+    - Supprime les caractères de contrôle et remplacements Unicode.
+    - Corrige les espaces inter-chiffres (ex: '1 2 0 0' -> '1200').
+    - Corrige les séquences 'a p r è s' -> 'après', etc.
+    - Remplace '�' par 'é' dans les contextes de mots français courants.
+    """
+    if not text:
+        return text
+
+    cleaned = text.replace("�", "é")
+
+    cleaned = _SPACED_DIGITS.sub("", cleaned)
+
+    corrections = {
+        "�": "é",
+        "Ã©": "é",
+        "Ã¨": "è",
+        "Ã¼": "ü",
+        "Ã´": "ô",
+        "Ã®": "î",
+        "Ã¢": "â",
+        "Ã ": "à",
+        "Ã§": "ç",
+        "Ãª": "ê",
+        "Ã«": "ë",
+        "Ã¯": "ï",
+        "Ã¶": "ö",
+        "Ã¹": "ù",
+        "Ã»": "û",
+        "t�te": "tête",
+        "tr�s": "très",
+        "proc�dure": "procédure",
+        "�viter": "éviter",
+        "d�marrer": "démarrer",
+        "d�s": "dès",
+        "�tat": "état",
+        "op�rateur": "opérateur",
+        "s�curité": "sécurité",
+        "gazi�re": "gazière",
+        "r�seau": "réseau",
+        "r�gulation": "régulation",
+        "d�bit": "débit",
+    }
+    for wrong, right in corrections.items():
+        cleaned = cleaned.replace(wrong, right)
+
+    cleaned = _GARBLE_PATTERN.sub("", cleaned)
+
+    cleaned = re.sub(
+        r"(?<=[a-zA-ZÀ-ÿ\u00C0-\u017F]) (?=[a-zA-ZÀ-ÿ\u00C0-\u017F]( |$))",
+        "",
+        cleaned,
+    )
+
+    return cleaned
+
+
+def _has_garbled_content(docs: list[Document]) -> bool:
+    """Détecte si un document contient du texte illisible (garbled)."""
+    if not docs:
+        return True
+    total = sum(len(d.page_content) for d in docs)
+    if total == 0:
+        return True
+    garbled = sum(len(_GARBLE_PATTERN.findall(d.page_content)) for d in docs)
+    return garbled / max(total, 1) > 0.05
+
+
+def _ocr_pdf(path: str) -> list[Document]:
+    """Fallback OCR pour PDF scannés (image-based).
+
+    Utilise pdf2image + pytesseract comme solution de dernier recours.
+    Si les dépendances ne sont pas disponibles, retourne un document
+    avec un avertissement explicite.
+    """
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except ImportError:
+        logger.warning(
+            "PDF scanné détetecté mais dépendances OCR manquantes. "
+            "Installez : pip install pdf2image pytesseract"
+        )
+        return [Document(
+            page_content=(
+                f"ERREUR OCR: Le fichier {Path(path).name} est un PDF scanné (image) "
+                "et les dépendances OCR ne sont pas installées. "
+                "Installez pdf2image + pytesseract ou fournissez un PDF texte."
+            ),
+            metadata={"source": path, "ocr_status": "dependencies_missing"},
+        )]
+
+    try:
+        images = convert_from_path(path, dpi=300)
+        pages_text: list[str] = []
+        for i, img in enumerate(images):
+            text = pytesseract.image_to_string(img, lang="fra")
+            if text.strip():
+                pages_text.append(text)
+
+        if not pages_text:
+            return [Document(
+                page_content=f"ERREUR OCR: Aucun texte extrait de {Path(path).name}.",
+                metadata={"source": path, "ocr_status": "empty_output"},
+            )]
+
+        return [
+            Document(page_content=txt, metadata={"source": path, "page": i, "ocr_status": "success"})
+            for i, txt in enumerate(pages_text)
+        ]
+    except Exception as exc:
+        logger.error("Échec OCR pour %s : %s", path, exc)
+        return [Document(
+            page_content=f"ERREUR OCR: {exc}",
+            metadata={"source": path, "ocr_status": "error"},
+        )]
 
 
 class DocumentLoadError(Exception):
@@ -78,11 +204,43 @@ def load_document(path: str) -> list[Document]:
         loader = _get_loader(path)
         docs = loader.load()
         logger.info("Chargé : %s (%d pages/sections)", Path(path).name, len(docs))
+
+        docs = _repair_all_documents(docs)
+
+        if _has_garbled_content(docs) and Path(path).suffix.lower() == ".pdf":
+            logger.warning(
+                "Contenu garbled détecté dans %s, tentative de fallback OCR…",
+                Path(path).name,
+            )
+            ocr_docs = _ocr_pdf(path)
+            if ocr_docs and any(d.metadata.get("ocr_status") == "success" for d in ocr_docs):
+                docs = ocr_docs
+                logger.info("OCR réussi pour %s (%d pages)", Path(path).name, len(docs))
+
         return docs
     except DocumentLoadError:
         raise
     except Exception as exc:
         raise DocumentLoadError(f"Erreur chargement {path} : {exc}") from exc
+
+
+def _repair_all_documents(docs: list[Document]) -> list[Document]:
+    """Applique la réparation d'encodement à tous les documents."""
+    repaired = []
+    for doc in docs:
+        original_len = len(doc.page_content)
+        repaired_content = _repair_text(doc.page_content)
+        if repaired_content != doc.page_content:
+            chars_fixed = abs(len(repaired_content) - original_len)
+            logger.info(
+                "Réparation d'encodage : %d caractères corrigés pour %s",
+                chars_fixed, doc.metadata.get("source", "?"),
+            )
+        repaired.append(Document(
+            page_content=repaired_content,
+            metadata=doc.metadata,
+        ))
+    return repaired
 
 
 def _is_supported_file(filename: str) -> bool:
@@ -181,3 +339,53 @@ def split_documents(
         chunk_overlap,
     )
     return chunks
+
+
+DOMAIN_KEYWORDS: set[str] = {
+    "robinet", "r0", "r1", "r2", "r3", "r4", "détente", "gaz",
+    "gazfio", "francel", "vs_gazfio", "vanne", "pression",
+    "consignation", "déconsignation", "bypass", "by-pass",
+    "sécurité", "epi", "poste", "sectionnement",
+}
+
+
+def check_document_quality(docs: list[Document], min_chars: int = 200) -> dict:
+    """Vérifie la qualité des documents chargés.
+
+    Args:
+        docs: Documents à vérifier.
+        min_chars: Nombre minimum de caractères total attendu.
+
+    Returns:
+        Dictionnaire avec les résultats de qualité:
+        - total_chars: nombre total de caractères
+        - domain_score: ratio de mots-clés domaine trouvés (0.0-1.0)
+        - is_adequate: True si le document est suffisant
+        - details: liste de messages d'avertissement
+    """
+    details: list[str] = []
+    total_chars = sum(len(d.page_content) for d in docs)
+
+    if total_chars < min_chars:
+        details.append(
+            f"Document trop court : {total_chars} car. (minimum {min_chars})."
+        )
+
+    all_text = " ".join(d.page_content.lower() for d in docs)
+    found_keywords = {kw for kw in DOMAIN_KEYWORDS if kw in all_text}
+    domain_score = len(found_keywords) / max(len(DOMAIN_KEYWORDS), 1)
+
+    if domain_score < 0.1:
+        details.append(
+            f"Score domaine faible : {domain_score:.2f} "
+            f"({len(found_keywords)}/{len(DOMAIN_KEYWORDS)} mots-clés trouvés). "
+            "Le document peut ne pas concerner le secteur gazier."
+        )
+
+    return {
+        "total_chars": total_chars,
+        "domain_score": domain_score,
+        "keywords_found": sorted(found_keywords),
+        "is_adequate": total_chars >= min_chars and domain_score >= 0.05,
+        "details": details,
+    }

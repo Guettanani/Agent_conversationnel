@@ -19,3 +19,4 @@ __pycache__/
 *.egg-info/requires.txt
 *.egg-info/top_level.txt
 *.dll
+.aider*

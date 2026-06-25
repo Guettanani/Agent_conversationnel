@@ -16,7 +16,7 @@ import requests
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_core.vectorstores import VectorStore, VectorStoreRetriever
 
 from .config import (
     DEFAULT_EMBEDDING_DEVICE,
@@ -326,12 +326,14 @@ def build_vectorstore(
 ) -> FAISS:
     """Construit un vectorstore FAISS à partir de chunks et d'embeddings.
 
+    Si FAISS n'est pas installé, utilise un fallback numpy-based.
+
     Args:
         chunks: Liste de documents découpés à indexer.
         embeddings: Instance d'embeddings pour la vectorisation.
 
     Returns:
-        Vectorstore FAISS indexé.
+        Vectorstore FAISS indexé (ou fallback NumpyVectorStore).
 
     Raises:
         ValueError: Si la liste de chunks est vide.
@@ -339,9 +341,17 @@ def build_vectorstore(
     if not chunks:
         raise ValueError("Aucun chunk à indexer.")
 
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    logger.info("FAISS créé : %d vecteurs indexés", vectorstore.index.ntotal)
-    return vectorstore
+    try:
+        import faiss  # noqa: F401
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        logger.info("FAISS créé : %d vecteurs indexés", vectorstore.index.ntotal)
+        return vectorstore
+    except ImportError:
+        logger.warning(
+            "FAISS non installé, utilisation du fallback numpy. "
+            "Installez faiss-cpu pour de meilleures performances."
+        )
+        return NumpyVectorStore.from_documents(chunks, embeddings)
 
 
 def save_vectorstore(vectorstore: FAISS, folder_path: str = DEFAULT_FAISS_INDEX_DIR) -> None:
@@ -351,9 +361,15 @@ def save_vectorstore(vectorstore: FAISS, folder_path: str = DEFAULT_FAISS_INDEX_
         vectorstore: Instance de FAISS à sauvegarder.
         folder_path: Chemin du dossier de sauvegarde.
     """
-    os.makedirs(folder_path, exist_ok=True)
-    vectorstore.save_local(folder_path)
-    logger.info("Vectorstore FAISS sauvegardé localement dans : %s", folder_path)
+    if hasattr(vectorstore, "save_local"):
+        os.makedirs(folder_path, exist_ok=True)
+        vectorstore.save_local(folder_path)
+        logger.info("Vectorstore FAISS sauvegardé localement dans : %s", folder_path)
+    else:
+        logger.warning(
+            "Vectorstore de type %s ne supporte pas la sauvegarde disque.",
+            type(vectorstore).__name__,
+        )
 
 
 def load_vectorstore(
@@ -466,3 +482,192 @@ def create_retriever(
         lambda_mult,
     )
     return retriever
+
+
+# ---------------------------------------------------------------------------
+# Fallback NumpyVectorStore (pure Python, no native dependency)
+# ---------------------------------------------------------------------------
+
+class NumpyVectorStore(VectorStore):
+    """Vectorstore fallback utilisant numpy pour la similarité cosinus.
+
+    Fournit une interface compatible avec FAISS pour les cas
+    où faiss-cpu/faiss-gpu n'est pas installé. Performances O(n) ce qui
+    est acceptable pour de petits corpus (<10k chunks).
+    """
+
+    def __init__(self) -> None:
+        self.documents: list[Document] = []
+        self._vectors: list[list[float]] = []
+        self._matrix: Any = None
+        self._dirty: bool = False
+
+    @classmethod
+    def from_documents(cls, chunks: list[Document], embeddings: Embeddings) -> "NumpyVectorStore":
+        vs = cls()
+        if not chunks:
+            raise ValueError("Aucun chunk à indexer.")
+
+        texts = [c.page_content for c in chunks]
+        vectors = embeddings.embed_documents(texts)
+
+        vs.documents = list(chunks)
+        vs._vectors = vectors
+        vs._rebuild_matrix()
+        logger.info(
+            "NumpyVectorStore créé : %d vecteurs indexés", len(vs.documents)
+        )
+        return vs
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: list[str],
+        embedding: Embeddings,
+        metadatas: list[dict] | None = None,
+        **kwargs: Any,
+    ) -> "NumpyVectorStore":
+        """Crée le vectorstore à partir de textes bruts (compatibilité LangChain)."""
+        docs = [
+            Document(page_content=t, metadata=m or {})
+            for t, m in zip(texts, metadatas or [{} for _ in texts])
+        ]
+        return cls.from_documents(docs, embedding)
+
+    def _rebuild_matrix(self) -> None:
+        if not self._vectors:
+            self._matrix = None
+            return
+        import numpy as np
+        self._matrix = np.array(self._vectors, dtype=np.float32)
+        norms = np.linalg.norm(self._matrix, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        self._matrix = self._matrix / norms
+        self._dirty = False
+
+    def add_documents(self, documents: list[Document], **kwargs: Any) -> list[str]:
+        """Ajoute des documents au vectorstore."""
+        if not documents:
+            return []
+        texts = [d.page_content for d in documents]
+        embeddings_instance = kwargs.get("embeddings")
+        if embeddings_instance:
+            new_vectors = embeddings_instance.embed_documents(texts)
+        else:
+            new_vectors = [[0.0]]  # placeholder
+        self.documents.extend(documents)
+        self._vectors.extend(new_vectors)
+        self._rebuild_matrix()
+        return [str(i) for i in range(len(documents))]
+
+    def similarity_search(self, query: str, k: int = 5, **kwargs: Any) -> list[Document]:
+        """Recherche par similarité cosinus."""
+        return self._search_with_scores(query, k)
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 5,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Recherche MMR (Maximal Marginal Relevance) simplifiée."""
+        if self._dirty:
+            self._rebuild_matrix()
+        if self._matrix is None or not self.documents:
+            return []
+
+        import numpy as np
+
+        embeddings_instance = kwargs.get("embeddings")
+        if embeddings_instance is not None:
+            query_vec = np.array(
+                embeddings_instance.embed_query(query), dtype=np.float32
+            )
+        else:
+            query_vec = np.mean(
+                np.array(self._vectors, dtype=np.float32), axis=0
+            )
+
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm > 0:
+            query_vec = query_vec / query_norm
+
+        all_scores = self._matrix @ query_vec
+        fetch_k = min(fetch_k, len(self.documents))
+        k = min(k, fetch_k)
+
+        selected: list[int] = []
+        candidates = list(range(len(self.documents)))
+
+        for _ in range(k):
+            best_score = -float("inf")
+            best_idx = -1
+            for idx in candidates:
+                relevance = all_scores[idx]
+                if selected:
+                    selected_vecs = self._matrix[selected]
+                    similarities = selected_vecs @ self._matrix[idx]
+                    max_sim = float(np.max(similarities))
+                else:
+                    max_sim = 0.0
+                mmr_score = lambda_mult * relevance - (1 - lambda_mult) * max_sim
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = idx
+            selected.append(best_idx)
+            candidates.remove(best_idx)
+
+        return [self.documents[i] for i in selected]
+
+    def _search_with_scores(self, query: str, k: int = 5) -> list[Document]:
+        """Recherche par similarité cosinus interne."""
+        if self._dirty:
+            self._rebuild_matrix()
+        if self._matrix is None or not self.documents:
+            return []
+
+        import numpy as np
+        embeddings_instance = getattr(self, "_embeddings", None)
+
+        if embeddings_instance is not None:
+            query_vec = np.array(
+                embeddings_instance.embed_query(query), dtype=np.float32
+            )
+        else:
+            query_vec = np.mean(
+                np.array(self._vectors, dtype=np.float32), axis=0
+            )
+
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm > 0:
+            query_vec = query_vec / query_norm
+
+        scores = self._matrix @ query_vec
+        top_k = min(k, len(self.documents))
+        indices = np.argsort(scores)[::-1][:top_k]
+        return [self.documents[i] for i in indices]
+
+    def as_retriever(self, **kwargs: Any) -> VectorStoreRetriever:
+        """Retourne un retriever compatible LangChain."""
+        search_kwargs = kwargs.get("search_kwargs", {})
+        if not search_kwargs:
+            search_kwargs = {"k": kwargs.get("k", DEFAULT_RETRIEVER_K)}
+        return VectorStoreRetriever(
+            vectorstore=self,
+            search_type=kwargs.get("search_type", "mmr"),
+            search_kwargs=search_kwargs,
+            tags=["NumpyVectorStore"],
+        )
+
+    @property
+    def index(self) -> _NumpyIndex:
+        return _NumpyIndex(len(self.documents))
+
+
+class _NumpyIndex:
+    """Compatible attribute access for ``index.ntotal``."""
+
+    def __init__(self, ntotal: int) -> None:
+        self.ntotal = ntotal
