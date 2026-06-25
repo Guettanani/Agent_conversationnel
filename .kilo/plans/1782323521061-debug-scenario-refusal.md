@@ -13,6 +13,7 @@
 | Phase 3: Fix E — FAISS fallback | ✅ Done | `NumpyVectorStore` class with MMR implementation |
 | Phase 3: Fix F — Prompt softening | ✅ Done | SYSTEM_SCENARIO no longer instructs refusal |
 | Phase 3: Fix G — JSON save directories | ✅ Done | Pre-conversion save in `scenarios/pre-conversion/`, post-conversion in `scenarios/post-conversion/` |
+| Phase 3: Fix H — organize_json.py | ⏳ Pending | Script to classify JSON files into config/ vs data/ |
 | Phase 4: Verification | ✅ Done | All 37 regression tests pass, 42 existing tests pass |
 | Phase 5: Regression tests | ✅ Done | tests_regression.py with 37 tests |
 | Phase 6: Comprehensive tests | ✅ Done | Full test suite executed |
@@ -608,6 +609,82 @@ scenarios/
 - Vérifier que `post-conversion/` est créé et contient le fichier converti
 - Vérifier que le fichier raw contient `scenario_text` et `sources`
 - Vérifier que le fichier converti contient `scenario_id`, `etat_initial`, `etapes`
+
+---
+
+#### Fix H — Script d'organisation JSON (config/ vs data/)
+
+**Objectif** : Créer un script `organize_json.py` qui scanne un répertoire source, analyse la structure interne de chaque fichier JSON, et les déplace/copie dans deux sous-répertoires :
+- `config/` — fichiers de configuration (paramètres, settings, constantes)
+- `data/` — fichiers de données textuelles (scénarios, contenu, entrées)
+
+**Fichier à créer** : `organize_json.py` (racine du projet)
+
+**Logique de classification** :
+
+```python
+CONFIG_KEYS = {"model", "api_url", "api_key", "token", "temperature", 
+               "max_tokens", "timeout", "host", "port", "database", "version",
+               "settings", "dependencies", "plugins", "rules", "commands",
+               "agents", "providers", "permissions"}
+
+DATA_KEYS = {"scenario_id", "etapes", "titre", "content", "text", "messages",
+             "history", "data", "results", "items", "records", "scenario_text",
+             "page_content", "actions", "etat_initial", "etat_resultant"}
+
+def classify_json(obj) -> str:
+    if isinstance(obj, dict):
+        keys = set(obj.keys())
+        if len(keys & CONFIG_KEYS) >= 2:
+            return "config"
+        if len(keys & DATA_KEYS) >= 1:
+            return "data"
+        # Si toutes les valeurs sont primitives → config
+        if all(isinstance(v, (str, int, float, bool, type(None))) for v in obj.values()):
+            return "config"
+        return "data"
+    elif isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
+        return "data"
+    return "unknown"
+```
+
+**Structure de sortie** :
+```
+organized/
+├── config/
+│   ├── kilo.json
+│   └── settings.json
+├── data/
+│   ├── scenario_output.json
+│   └── agent-manager.json
+└── unknown/
+    └── (fichiers ambigus)
+```
+
+**CLI** :
+```bash
+python organize_json.py --source ./ --dest ./organized --dry-run
+python organize_json.py --source ./scenarios --dest ./organized --move
+```
+
+**Options** :
+- `--source` : Répertoire source (défaut: `./`)
+- `--dest` : Répertoire destination (défaut: `./organized`)
+- `--dry-run` : Afficher la classification sans déplacer
+- `--move` : Déplacer au lieu de copier
+- `--depth` : Profondeur de scan (défaut: infini)
+
+**Risques** :
+- Fichier JSON invalide → skip avec warning
+- Conflit de noms → renommer avec suffixe (`file_1.json`)
+- Permissions insuffisantes → message clair
+
+**Tests à ajouter** :
+- Fichier config typique → classé dans `config/`
+- Fichier data typique → classé dans `data/`
+- Fichier ambigu → classé dans `unknown/`
+- Fichier invalide → skip avec warning
+- Mode dry-run → aucun fichier déplacé
 
 ---
 

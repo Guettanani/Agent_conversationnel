@@ -82,6 +82,9 @@ def run_pipeline(
         logger.exception("[PIPELINE ÉTAPE 1/3] ÉCHEC — Génération du scénario")
         raise PipelineError(f"Échec de la génération du scénario : {exc}") from exc
 
+    # === Sauvegarde PRE-conversion (scénario texte brut) ===
+    _save_pre_conversion(topic, scenario_text, sources, store_dir)
+
     try:
         logger.info("[PIPELINE ÉTAPE 2/3] Conversion en JSON Unity...")
         result = convert_scenario_to_json(scenario_text, llm_config)
@@ -89,6 +92,9 @@ def run_pipeline(
     except Exception as exc:
         logger.exception("[PIPELINE ÉTAPE 2/3] ÉCHEC — Conversion JSON")
         raise PipelineError(f"Échec de la conversion JSON : {exc}") from exc
+
+    # === Sauvegarde POST-conversion (JSON structuré) ===
+    _save_post_conversion(topic, result, store_dir)
 
     # Validation de la structure du JSON généré
     try:
@@ -110,6 +116,67 @@ def run_pipeline(
     logger.info("PIPELINE TERMINÉ AVEC SUCCÈS")
     logger.info("=" * 70)
     return result
+
+
+def _save_pre_conversion(topic: str, scenario_text: str, sources: list, store_dir: str | None) -> None:
+    """Sauvegarde le scénario texte brut AVANT conversion JSON.
+
+    Args:
+        topic: Thème du scénario.
+        scenario_text: Texte brut du scénario généré.
+        sources: Liste des documents sources utilisés.
+        store_dir: Répertoire de persistance (défaut: ./scenarios).
+    """
+    if store_dir is None:
+        store_dir = "./scenarios"
+
+    pre_dir = Path(store_dir) / "pre-conversion"
+    pre_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_topic = topic.replace(" ", "_").replace("/", "_")[:50]
+    pre_path = pre_dir / f"{safe_topic}_raw.json"
+
+    payload = {
+        "topic": topic,
+        "scenario_text": scenario_text,
+        "sources": [s.metadata if hasattr(s, "metadata") else {"source": str(s)} for s in sources],
+    }
+
+    try:
+        pre_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Scénario brut sauvegardé (pre-conversion) : %s", pre_path)
+    except OSError as exc:
+        logger.warning("Impossible de sauvegarder le scénario brut : %s", exc)
+
+
+def _save_post_conversion(topic: str, result: dict[str, Any], store_dir: str | None) -> None:
+    """Sauvegarde le scénario JSON structuré APRÈS conversion.
+
+    Args:
+        topic: Thème du scénario.
+        result: Dictionnaire JSON du scénario converti.
+        store_dir: Répertoire de persistance (défaut: ./scenarios).
+    """
+    if store_dir is None:
+        store_dir = "./scenarios"
+
+    post_dir = Path(store_dir) / "post-conversion"
+    post_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_topic = topic.replace(" ", "_").replace("/", "_")[:50]
+    post_path = post_dir / f"{safe_topic}.json"
+
+    try:
+        post_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Scénario converti sauvegardé (post-conversion) : %s", post_path)
+    except OSError as exc:
+        logger.warning("Impossible de sauvegarder le scénario converti : %s", exc)
 
 
 def validate_scenario_structure(data: dict[str, Any]) -> None:

@@ -19278,7 +19278,7 @@ class VRScenarioApp:
                 + " se déroule en " + str(len(etapes))
                 + " étapes : " + noms + "."
             )
-        return "Le scénario " + titre + " vient d'être généré."
+        return  titre + " vient d'être généré."
 
     def _announce_scenario(self, scenario_json, scenario_text: str) -> None:
         """Présente les grandes lignes du scénario à voix haute."""
